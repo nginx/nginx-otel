@@ -11,8 +11,8 @@ class TraceService(trace_service_pb2_grpc.TraceServiceServicer):
     batches = []
 
     def Export(self, request, context):
-        self.batches.append(request.resource_spans)
         self.last_metadata = context.invocation_metadata()
+        self.batches.append(request.resource_spans)
         return trace_service_pb2.ExportTracePartialSuccess()
 
     def get_batch(self):

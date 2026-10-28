@@ -64,9 +64,17 @@ def nginx_config(request, pytestconfig, testdir, logger):
 
 
 @pytest.fixture(scope="module")
-def nginx(testdir, pytestconfig, nginx_config, cert, logger, otelcol):
+def nginx_env(request):
+    return getattr(request, "param", {})
+
+
+@pytest.fixture(scope="module")
+def nginx(
+    testdir, pytestconfig, nginx_config, nginx_env, cert, logger, otelcol
+):
     (testdir / "nginx.conf").write_text(nginx_config)
     logger.info("Starting nginx...")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OTEL_")}
     proc = subprocess.Popen(
         [
             pytestconfig.option.nginx,
@@ -76,7 +84,8 @@ def nginx(testdir, pytestconfig, nginx_config, cert, logger, otelcol):
             "nginx.conf",
             "-e",
             "error.log",
-        ]
+        ],
+        env={**env, **nginx_env},
     )
     logger.debug(f"args={' '.join(proc.args)}")
     logger.debug(f"pid={proc.pid}")
