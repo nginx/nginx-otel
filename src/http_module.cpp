@@ -6,7 +6,9 @@
 #include "trace_context.hpp"
 #include "batch_exporter.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <iterator>
 
 extern ngx_module_t gHttpModule;
 
@@ -43,6 +45,7 @@ struct LocationConf {
     ngx_uint_t traceContext;
 
     ngx_http_complex_value_t* spanName;
+    ngx_uint_t spanSemconv;
     ngx_array_t spanAttrs;
 };
 
@@ -62,6 +65,21 @@ const ngx_uint_t Inject = 2;
     { ngx_string("extract"), Extract },
     { ngx_string("inject"), Inject },
     { ngx_string("propagate"), Extract | Inject },
+    { ngx_null_string, 0 }
+};
+
+}
+
+namespace Semconv {
+
+const ngx_uint_t Legacy = 0;
+const ngx_uint_t Stable = 1;
+const ngx_uint_t Dual = 2;
+
+/*const*/ ngx_conf_enum_t Types[] = {
+    { ngx_string("legacy"), Legacy },
+    { ngx_string("stable"), Stable },
+    { ngx_string("dual"), Dual },
     { ngx_null_string, 0 }
 };
 
@@ -101,6 +119,13 @@ ngx_command_t gCommands[] = {
       ngx_http_set_complex_value_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(LocationConf, spanName) },
+
+    { ngx_string("otel_span_semconv"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(LocationConf, spanSemconv),
+      &Semconv::Types },
 
     { ngx_string("otel_span_attr"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
@@ -405,19 +430,14 @@ StrView getServerName(ngx_http_request_t* r)
     return toStrView(name);
 }
 
-void addDefaultAttrs(BatchExporter::Span& span, ngx_http_request_t* r)
+void addLegacyAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
+                    ngx_uint_t status)
 {
     // based on trace semantic conventions for HTTP from 1.16.0 OTel spec
 
     span.add("http.method", toStrView(r->method_name));
 
     span.add("http.target", toStrView(r->unparsed_uri));
-
-    auto clcf = (ngx_http_core_loc_conf_t*)
-        ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-    if (clcf->name.len) {
-        span.add("http.route", toStrView(clcf->name));
-    }
 
     span.add("http.scheme", r->connection->ssl ? "https" : "http");
 
@@ -436,13 +456,8 @@ void addDefaultAttrs(BatchExporter::Span& span, ngx_http_request_t* r)
     auto sent = r->connection->sent - (off_t)r->header_size;
     span.add("http.response_content_length", sent > 0 ? sent : 0);
 
-    auto status = r->err_status ? r->err_status : r->headers_out.status;
     if (status) {
         span.add("http.status_code", status);
-
-        if (status >= 500) {
-            span.setError();
-        }
     }
 
     span.add("net.host.name", getServerName(r));
@@ -460,7 +475,145 @@ void addDefaultAttrs(BatchExporter::Span& span, ngx_http_request_t* r)
     span.add("net.sock.peer.port", ngx_inet_get_port(r->connection->sockaddr));
 }
 
-StrView getSpanName(ngx_http_request_t* r)
+StrView getStableMethod(ngx_http_request_t* r)
+{
+    auto method = toStrView(r->method_name);
+    for (StrView name : {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS",
+                         "PATCH", "POST", "PUT", "TRACE"}) {
+        if (method == name) {
+            return name;
+        }
+    }
+    return "_OTHER";
+}
+
+std::string redactQuery(StrView query)
+{
+    static const StrView sensitive[] = {
+        "X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token",
+        "AWSAccessKeyId", "Signature", "sig", "X-Goog-Signature"
+    };
+
+    std::string result;
+    result.reserve(query.size());
+    while (!query.empty()) {
+        auto end = query.find('&');
+        auto pair = query.substr(0, end);
+        auto equals = pair.find('=');
+        auto key = pair.substr(0, equals);
+
+        // Even a fully percent-encoded sensitive key fits in this buffer.
+        u_char decoded[3 * (sizeof("X-Amz-Security-Token") - 1)];
+        bool redact = false;
+        if (equals != StrView::npos && key.size() <= sizeof(decoded)) {
+            auto dst = decoded;
+            auto src = (u_char*)key.data();
+            ngx_unescape_uri(&dst, &src, key.size(), 0);
+            StrView name((const char*)decoded, dst - decoded);
+            redact = std::find(std::begin(sensitive), std::end(sensitive),
+                               name) != std::end(sensitive);
+        }
+
+        if (redact) {
+            result.append(pair.data(), equals + 1);
+            result += "REDACTED";
+        } else {
+            result.append(pair.data(), pair.size());
+        }
+        if (end == StrView::npos) {
+            break;
+        }
+        result += '&';
+        query = query.substr(end + 1);
+    }
+    return result;
+}
+
+void addStableAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
+                    ngx_uint_t status)
+{
+    auto method = getStableMethod(r);
+    span.add("http.request.method", method);
+    if (method == "_OTHER") {
+        span.add("http.request.method_original", toStrView(r->method_name));
+    }
+
+    auto target = toStrView(r->unparsed_uri);
+    auto separator = target.find('?');
+    span.add("url.path", target.substr(0, separator));
+    if (separator != StrView::npos && separator + 1 < target.size()) {
+        auto query = redactQuery(target.substr(separator + 1));
+        span.add("url.query", StrView(query.data(), query.size()));
+    }
+    span.add("url.scheme", r->connection->ssl ? "https" : "http");
+
+    auto protocol = toStrView(r->http_protocol);
+    if (startsWith(protocol, "HTTP/") && protocol.size() > 5) {
+        auto version = protocol.substr(5);
+        if (version == "2.0" || version == "3.0") {
+            version = version.substr(0, 1);
+        }
+        span.add("network.protocol.version", version);
+    } else if (r->http_version == NGX_HTTP_VERSION_9) {
+        span.add("network.protocol.version", "0.9");
+    }
+
+    if (r->headers_in.user_agent) {
+        span.add("user_agent.original", toStrView(r->headers_in.user_agent->value));
+    }
+
+    if (status) {
+        span.add("http.response.status_code", status);
+    }
+    if (status >= 500) {
+        u_char code[NGX_INT_T_LEN];
+        auto end = ngx_snprintf(code, sizeof(code), "%ui", status);
+        span.add("error.type", StrView((const char*)code, end - code));
+    }
+
+    auto address = r->headers_in.server.len ? toStrView(r->headers_in.server)
+                                            : getServerName(r);
+    if (!address.empty()) {
+        span.add("server.address", address);
+    }
+    if (ngx_connection_local_sockaddr(r->connection, NULL, 0) == NGX_OK) {
+        auto port = ngx_inet_get_port(r->connection->local_sockaddr);
+        if (port) {
+            span.add("server.port", port);
+        }
+    }
+
+    auto peer = toStrView(r->connection->addr_text);
+    span.add("network.peer.address", peer);
+    span.add("client.address", peer);
+    auto port = ngx_inet_get_port(r->connection->sockaddr);
+    if (port) {
+        span.add("network.peer.port", port);
+    }
+}
+
+void addDefaultAttrs(BatchExporter::Span& span, ngx_http_request_t* r,
+                     ngx_uint_t mode)
+{
+    auto status = r->err_status ? r->err_status : r->headers_out.status;
+    if (mode != Semconv::Stable) {
+        addLegacyAttrs(span, r, status);
+    }
+    if (mode != Semconv::Legacy) {
+        addStableAttrs(span, r, status);
+    }
+
+    auto clcf = (ngx_http_core_loc_conf_t*)
+        ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (clcf->name.len) {
+        span.add("http.route", toStrView(clcf->name));
+    }
+    if (status >= 500) {
+        span.setError();
+    }
+}
+
+StrView getSpanName(ngx_http_request_t* r, std::string& name)
 {
     auto lcf = getLocationConf(r);
 
@@ -475,7 +628,18 @@ StrView getSpanName(ngx_http_request_t* r)
         auto clcf = (ngx_http_core_loc_conf_t*)
             ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-        return toStrView(clcf->name);
+        auto route = toStrView(clcf->name);
+        if (lcf->spanSemconv == Semconv::Legacy) {
+            return route;
+        }
+
+        auto method = getStableMethod(r);
+        name = method == "_OTHER" ? "HTTP" : std::string(method);
+        if (!route.empty()) {
+            name += ' ';
+            name.append(route.data(), route.size());
+        }
+        return StrView(name.data(), name.size());
     }
 }
 
@@ -516,13 +680,15 @@ ngx_int_t onRequestEnd(ngx_http_request_t* r)
     };
 
     try {
+        std::string name;
+        auto mode = getLocationConf(r)->spanSemconv;
         BatchExporter::SpanInfo info{
-            getSpanName(r), ctx->current, ctx->parent.spanId,
+            getSpanName(r, name), ctx->current, ctx->parent.spanId,
             toNanoSec(r->start_sec, r->start_msec),
             toNanoSec(now->sec, now->msec)};
 
-        bool ok = gExporter->add(info, [r](BatchExporter::Span& span) {
-            addDefaultAttrs(span, r);
+        bool ok = gExporter->add(info, [r, mode](BatchExporter::Span& span) {
+            addDefaultAttrs(span, r, mode);
             addCustomAttrs(span, r);
         });
 
@@ -946,6 +1112,7 @@ void* createLocationConf(ngx_conf_t* cf)
     conf->trace = (ngx_http_complex_value_t*)NGX_CONF_UNSET_PTR;
     conf->traceContext = NGX_CONF_UNSET_UINT;
     conf->spanName = (ngx_http_complex_value_t*)NGX_CONF_UNSET_PTR;
+    conf->spanSemconv = NGX_CONF_UNSET_UINT;
 
     return conf;
 }
@@ -958,6 +1125,8 @@ char* mergeLocationConf(ngx_conf_t* cf, void* parent, void* child)
     ngx_conf_merge_ptr_value(conf->trace, prev->trace, NULL);
     ngx_conf_merge_uint_value(conf->traceContext, prev->traceContext, 0);
     ngx_conf_merge_ptr_value(conf->spanName, prev->spanName, NULL);
+    ngx_conf_merge_uint_value(conf->spanSemconv, prev->spanSemconv,
+                              Semconv::Legacy);
 
     if (conf->spanAttrs.elts == NULL) {
         conf->spanAttrs = prev->spanAttrs;

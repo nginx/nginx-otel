@@ -48,6 +48,20 @@ load_module modules/ngx_otel_module.so;
 ## Configuring the Module
 For a complete list of directives, embedded variables, default span attributes and sample configurations, please refer to the [`ngx_otel_module` documentation](https://nginx.org/en/docs/ngx_otel_module.html).
 
+### HTTP span conventions
+
+Use `otel_span_semconv` in `http`, `server`, or `location` to select the
+HTTP span format. The setting is inherited by child contexts.
+
+* `legacy` is the default and keeps the existing attributes and span names.
+* `stable` emits the updated HTTP attributes, including `http.request.method`,
+  `url.path`, and `http.response.status_code`.
+* `dual` emits both sets of attributes so trace queries can migrate gradually.
+
+The `stable` and `dual` modes use names such as `GET /api/`. An explicit
+`otel_span_name` takes precedence in every mode. Use `otel_span_attr` to
+opt in to additional attributes such as HTTP headers.
+
 ## Examples
 Use these examples to configure some common use-cases for OTel tracing.
 
