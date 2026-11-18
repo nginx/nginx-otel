@@ -49,6 +49,22 @@ http {
             return 500 "ERR";
         }
 
+        location /stable/ {
+            otel_span_semconv stable;
+            return 200 "OK";
+        }
+
+        location /dual/ {
+            otel_span_semconv dual;
+            return 200 "OK";
+        }
+
+        location /stable-custom {
+            otel_span_semconv stable;
+            otel_span_name custom_location;
+            return 200 "OK";
+        }
+
         location /custom {
             otel_span_name custom_location;
             otel_span_attr http.request.completion
@@ -173,6 +189,54 @@ def test_default_attributes(client, trace_service, http_ver, path, status):
     assert get_attr(span, "net.host.port") == port
     assert get_attr(span, "net.sock.peer.addr") == "127.0.0.1"
     assert get_attr(span, "net.sock.peer.port") in range(1024, 65536)
+
+
+@pytest.mark.parametrize("mode", ["stable", "dual"])
+def test_span_semconv(client, trace_service, mode):
+    route = f"/{mode}/"
+    path = route + "details"
+    assert client.get(f"http://127.0.0.1:18080{path}?page=2").status_code == 200
+
+    span = trace_service.get_span()
+    assert span.name == "GET " + route
+    assert get_attr(span, "http.request.method") == "GET"
+    assert get_attr(span, "url.path") == path
+    assert get_attr(span, "url.query") == "page=2"
+    assert get_attr(span, "url.scheme") == "http"
+    assert get_attr(span, "http.route") == route
+    assert get_attr(span, "network.protocol.version") == "1.1"
+    assert get_attr(span, "http.response.status_code") == 200
+    assert get_attr(span, "server.address") == "127.0.0.1"
+    assert get_attr(span, "server.port") == 18080
+    assert get_attr(span, "network.peer.address") == "127.0.0.1"
+    assert get_attr(span, "network.peer.port") in range(1024, 65536)
+    assert get_attr(span, "client.address") == "127.0.0.1"
+    assert get_attr(span, "user_agent.original") == f"niquests/{niquests.__version__}"
+    if mode == "dual":
+        assert get_attr(span, "http.method") == "GET"
+        assert get_attr(span, "http.target") == path + "?page=2"
+    else:
+        assert get_attr(span, "http.method") is None
+        assert get_attr(span, "http.target") is None
+
+
+def test_span_semconv_preserves_custom_name(client, trace_service):
+    assert client.get("http://127.0.0.1:18080/stable-custom").status_code == 200
+    span = trace_service.get_span()
+    assert span.name == "custom_location"
+    assert get_attr(span, "http.request.method") == "GET"
+    assert get_attr(span, "url.query") is None
+
+
+def test_span_semconv_redacts_signed_query(client, trace_service):
+    url = "http://127.0.0.1:18080/stable/?page=2&sig=one&%73ig=two"
+    assert client.get(url).status_code == 200
+
+    span = trace_service.get_span()
+    assert get_attr(span, "url.path") == "/stable/"
+    query = get_attr(span, "url.query")
+    # The HTTP client may normalize the percent-encoded unreserved character.
+    assert query.replace("%73ig", "sig") == "page=2&sig=REDACTED&sig=REDACTED"
 
 
 def test_custom_attributes(client, trace_service):
