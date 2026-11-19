@@ -42,6 +42,13 @@ http {
         server_name  localhost;
 
         location /ok {
+            client_max_body_size 1k;
+            return 200 "OK";
+        }
+
+        location /limited-untraced {
+            client_max_body_size 1k;
+            otel_trace off;
             return 200 "OK";
         }
 
@@ -329,3 +336,20 @@ def test_tls_export(client, trace_service):
     assert client.get("http://127.0.0.1:18080/ok").status_code == 200
 
     assert trace_service.get_span().name == "/ok"
+
+
+@pytest.mark.parametrize(("size", "status"), [(20, 200), (2000, 413)])
+def test_body_size_limit_span(client, trace_service, size, status):
+    response = client.post("http://127.0.0.1:18080/ok", data=b"x" * size)
+    assert response.status_code == status
+    span = trace_service.get_span()
+    assert span.name == "/ok"
+    assert get_attr(span, "http.status_code") == status
+
+
+def test_body_size_limit_trace_off(client, trace_service):
+    response = client.post("http://127.0.0.1:18080/limited-untraced", data=b"x" * 2000)
+    assert response.status_code == 413
+
+    time.sleep(0.01)
+    assert len(trace_service.batches) == 0
