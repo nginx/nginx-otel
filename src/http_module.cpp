@@ -353,7 +353,7 @@ OtelCtx* ensureOtelCtx(ngx_http_request_t* r)
     return ctx;
 }
 
-ngx_int_t onRequestStart(ngx_http_request_t* r)
+ngx_int_t startTrace(ngx_http_request_t* r, bool allowInjection)
 {
     // don't let internal redirects to override sampling decision
     if (r->internal) {
@@ -385,11 +385,16 @@ ngx_int_t onRequestStart(ngx_http_request_t* r)
 
     ngx_int_t rc = NGX_OK;
 
-    if (lcf->traceContext & Propagation::Inject) {
+    if (allowInjection && (lcf->traceContext & Propagation::Inject)) {
         rc = inject(r, ctx->current);
     }
 
     return rc == NGX_OK ? NGX_DECLINED : rc;
+}
+
+ngx_int_t onRequestStart(ngx_http_request_t* r)
+{
+    return startTrace(r, true);
 }
 
 StrView getServerName(ngx_http_request_t* r)
@@ -505,6 +510,24 @@ void addCustomAttrs(BatchExporter::Span& span, ngx_http_request_t* r)
 ngx_int_t onRequestEnd(ngx_http_request_t* r)
 {
     auto ctx = getOtelCtx(r);
+    if (!ctx && r == r->main && !r->internal
+        && r->err_status == NGX_HTTP_REQUEST_ENTITY_TOO_LARGE)
+    {
+        auto cmcf = (ngx_http_core_main_conf_t*)ngx_http_get_module_main_conf(
+            r, ngx_http_core_module);
+
+        // The body limit can finalize the request before the location rewrite
+        // handler initializes the span. At log time only the span can be made.
+        auto phase = static_cast<ngx_uint_t>(r->phase_handler);
+        if (phase < cmcf->phase_engine.location_rewrite_index) {
+            auto rc = startTrace(r, false);
+            if (rc != NGX_DECLINED) {
+                return rc;
+            }
+            ctx = getOtelCtx(r);
+        }
+    }
+
     if (!ctx || !ctx->current.sampled) {
         return NGX_DECLINED;
     }
